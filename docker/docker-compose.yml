@@ -1,0 +1,300 @@
+services:
+  database:
+    image: docker.io/library/postgres:14
+    networks:
+      - appnet
+    container_name: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backup:/backup
+    restart: on-failure
+    env_file:
+      - .env.dop
+    ports:
+      - "5432:5432"
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/src/backend/Dockerfile
+    container_name: backend
+    ports:
+      - "8081:8081"
+      - "5173:5173"
+    depends_on:
+      - database
+    networks:
+      - appnet
+    env_file:
+      - .env.dop
+    healthcheck:
+      test: ["CMD", "curl", "-f", "--http1.1", "https://backend:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./backups:/backup
+      - ./:/ssl:ro
+      - ./logs:/app/logs
+    restart: on-failure
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  prometheus:
+    container_name: prometheus
+    image: docker.io/prom/prometheus
+    restart: on-failure
+    networks:
+      - appnet
+    # env_file: ./secrets/.env
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./src/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./src/prometheus/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  node-exporter:
+    container_name: node-exporter
+    image: docker.io/prom/node-exporter:latest
+    ports:
+      - "9101:9100"
+    networks:
+      - appnet
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres-exporter:
+    container_name: postgres-exporter
+    image: docker.io/prometheuscommunity/postgres-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: "postgresql://admin:goodPassword123@postgres:5432/myapp?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - appnet
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  elasticsearch:
+    container_name: elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.15.0
+    restart: on-failure
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD-SHELL", "curl --user elastic:${ELASTIC_PASSWORD} --silent --fail https://localhost:9200/_cluster/health -k || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - appnet
+    environment:
+      - bootstrap.memory_lock=true
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=/usr/share/elasticsearch/config/certs/elasticsearch.key
+      - xpack.security.http.ssl.certificate=/usr/share/elasticsearch/config/certs/elasticsearch.crt
+      - xpack.security.http.ssl.certificate_authorities=/usr/share/elasticsearch/config/certs/ca.pem
+      - xpack.ilm.enabled=true
+      - path.repo=/usr/share/elasticsearch/snapshots
+    ports:
+      - 9200:9200
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+      - ./src/elasticsearch/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+      - ./certs/elasticsearch/elasticsearch.crt:/usr/share/elasticsearch/config/certs/elasticsearch.crt:ro
+      - ./certs/elasticsearch/elasticsearch.key:/usr/share/elasticsearch/config/certs/elasticsearch.key:ro
+      - ./certs/ca.pem:/usr/share/elasticsearch/config/certs/ca.pem:ro
+      - snapdata:/usr/share/elasticsearch/snapshots
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kibana:
+    container_name: kibana
+    image: docker.elastic.co/kibana/kibana:7.15.0
+    restart: on-failure
+    networks:
+      - appnet
+    ports:
+      - "5601:5601"
+    env_file:
+      - .env
+    environment:
+      - ELASTICSEARCH_HOSTS=https://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=none
+    volumes:
+      - kibana:/usr/share/kibana
+      - ./src/kibana/dashboards:/usr/share/kibana/data/saved_objects
+      - ./src/kibana/kibana.yml:/usr/share/kibana/config/kibana.yml
+      - ./certs/kibana/kibana.crt:/usr/share/kibana/config/certs/kibana.crt:ro
+      - ./certs/kibana/kibana.key:/usr/share/kibana/config/certs/kibana.key:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I https://localhost:5601 | head -1 | grep -q 'HTTP/1.1 200 OK' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  logstash:
+    container_name: logstash
+    build:
+      context: ..
+      dockerfile: docker/src/logstash/Dockerfile
+    image: custom-logstash:latest
+    restart: unless-stopped
+    networks:
+      - appnet
+    environment:
+        - LS_JAVA_OPTS=-Xms1g -Xmx1g -Dio.netty.allocator.maxOrder=12
+        - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+        - LOGSTASH_LOG_LEVEL=error
+        - xpack.monitoring.enabled=false
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    volumes:
+      - ./certs/ca.pem:/usr/share/logstash/config/certs/ca.pem:ro
+      - ./src/logstash/logs:/usr/share/logstash/logs
+      # - ./src/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:z
+      - ./src/logstash/config/pipeline:/usr/share/logstash/pipeline:ro
+      - esdata:/usr/share/logstash/data
+    depends_on:
+      - elasticsearch
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:7.15.0
+    container_name: filebeat_1
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    volumes:
+      - ./sample-logs:/sample-logs:ro
+      - ./src/logstash/logs:/var/logs
+      - /var/log:/var/log:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - $XDG_RUNTIME_DIR/podman/podman.sock:/var/run/docker.sock:ro
+      - esdata:/var/lib/elasticsearch/data
+      - ./certs/ca.pem:/usr/share/elasticsearch/config/certs/ca.pem:ro
+      - ./src/logstash/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./logs:/app/logs
+    depends_on:
+      - logstash
+    networks:
+      - appnet
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    container_name: grafana
+    image: grafana/grafana
+    build:
+      context: ..
+      dockerfile: docker/src/grafana/Dockerfile
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./src/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./src/grafana/alerting/alerts.yml:/etc/grafana/provisioning/alerting/alerts.yml:ro
+      - ./src/grafana/grafana.ini:/etc/grafana/grafana.ini
+      - ./src/grafana/ssl:/etc/grafana/ssl:ro
+      - ./src/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+    restart: on-failure
+    user: "472"
+    networks:
+      - appnet
+    env_file:
+      - .env.dop
+    environment:
+      GF_SERVER_ROOT_URL: https://localhost:3000
+      GF_SERVER_PROTOCOL: https
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_PROMETHEUS_PROXY_ENABLED: "true"
+      GF_PROMETHEUS_URL: http://prometheus:9090
+    ports:
+      - "3000:3000"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "https://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  backup:
+    container_name: backup
+    build:
+      context: ..
+      dockerfile: docker/src/backup/Dockerfile
+    volumes:
+      - postgres_data:/mnt/postgres:ro
+      - prometheus_data:/mnt/prometheus:ro
+      - esdata:/mnt/esdata:ro
+      - backup:/mnt/backup
+    networks:
+      - appnet
+
+volumes:
+  postgres_data:
+  grafana-storage:
+  prometheus_data:
+  esdata:
+  kibana:
+  certs:
+  backup:
+  ssl:
+  snapdata:
+
+networks:
+  appnet:
+    driver: bridge
